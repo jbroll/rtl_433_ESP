@@ -96,6 +96,26 @@
 #  define MINIMUM_SIGNAL_LENGTH 500
 #endif
 
+// Bounded poll for the RF69 RSSI measurement to complete
+#ifndef RSSI_TRIGGER_RETRIES
+#  define RSSI_TRIGGER_RETRIES 8
+#endif
+
+// A triggered RF69 RSSI tracks the OOK envelope and collapses in the gaps
+// between pulses. Hold the peak for longer than the widest gap a decoder
+// expects within a packet (Acurite 592TXR sync gap is 596 us) so that a sample
+// landing in a gap does not tear down an in-progress capture.
+#ifndef RSSI_PEAK_HOLD
+#  define RSSI_PEAK_HOLD 2000
+#endif
+
+// Minimum captured signal duration to hand to the decoder. Defaults to
+// MINIMUM_SIGNAL_LENGTH, which also sets the dropout bridging window; override
+// it alone to admit packets shorter than that window.
+#ifndef MINIMUM_SIGNAL_DURATION
+#  define MINIMUM_SIGNAL_DURATION MINIMUM_SIGNAL_LENGTH
+#endif
+
 // SX127X OOK Reception Floor
 #ifndef OOK_FIXED_THRESHOLD
 #  define OOK_FIXED_THRESHOLD 15 // Default value after a bit of experimentation
@@ -152,6 +172,10 @@
 #  endif
 #endif
 
+// Prototype wiring is not reliable at RadioLib's 2 MHz default; the chip
+// version read during begin() fails outright above this.
+#define RF_MODULE_SPI_SETTINGS SPISettings(500000, MSBFIRST, SPI_MODE0)
+
 #ifdef RF_SX1276
 #  define RF_MODULE_RECEIVER_GPIO RF_MODULE_DIO2
 #  define STR_MODULE              "SX1276"
@@ -193,6 +217,34 @@
 #  else
 #    define RADIO_LIB_MODULE \
       new Module(SS, RF_MODULE_GDO0, RADIOLIB_NC, RF_MODULE_GDO2)
+#  endif
+#endif
+
+#ifdef RF_SX1231
+#  define RF_MODULE_RECEIVER_GPIO RF_MODULE_DIO2
+#  define STR_MODULE              "SX1231"
+#  if defined(RF_MODULE_SCK) && defined(RF_MODULE_MISO) && \
+      defined(RF_MODULE_MOSI) && defined(RF_MODULE_CS)
+#    define RADIO_LIB_MODULE                                                  \
+      new Module(RF_MODULE_CS, RF_MODULE_DIO0, RF_MODULE_RST, RF_MODULE_DIO1, \
+                 newSPI, RF_MODULE_SPI_SETTINGS)
+#  else
+#    define RADIO_LIB_MODULE \
+      new Module(RF_MODULE_CS, RF_MODULE_DIO0, RF_MODULE_RST, RF_MODULE_DIO1)
+#  endif
+#endif
+
+#ifdef RF_RF69
+#  define RF_MODULE_RECEIVER_GPIO RF_MODULE_DIO2
+#  define STR_MODULE              "RF69"
+#  if defined(RF_MODULE_SCK) && defined(RF_MODULE_MISO) && \
+      defined(RF_MODULE_MOSI) && defined(RF_MODULE_CS)
+#    define RADIO_LIB_MODULE                                                  \
+      new Module(RF_MODULE_CS, RF_MODULE_DIO0, RF_MODULE_RST, RF_MODULE_DIO1, \
+                 newSPI, RF_MODULE_SPI_SETTINGS)
+#  else
+#    define RADIO_LIB_MODULE \
+      new Module(RF_MODULE_CS, RF_MODULE_DIO0, RF_MODULE_RST, RF_MODULE_DIO1)
 #  endif
 #endif
 
@@ -262,7 +314,7 @@ public:
    */
   void setRSSIThreshold(int);
 
-#if defined(RF_SX1276) || defined(RF_SX1278)
+#if defined(RF_SX1276) || defined(RF_SX1278) || defined(RF_SX1231) || defined(RF_RF69)
   /**
    * Set setOOKThreshold
    *

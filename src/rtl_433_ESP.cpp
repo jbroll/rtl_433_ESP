@@ -51,7 +51,15 @@ SX1278 radio = RADIO_LIB_MODULE;
 CC1101 radio = RADIO_LIB_MODULE;
 #endif
 
-#if defined(RF_SX1276) || defined(RF_SX1278)
+#ifdef RF_SX1231
+SX1231 radio = RADIO_LIB_MODULE;
+#endif
+
+#ifdef RF_RF69
+RF69 radio = RADIO_LIB_MODULE;
+#endif
+
+#if defined(RF_SX1276) || defined(RF_SX1278) || defined(RF_SX1231) || defined(RF_RF69)
 uint8_t rtl_433_ESP::OokFixedThreshold = OOK_FIXED_THRESHOLD;
 #endif
 
@@ -59,7 +67,7 @@ Module* _mod = radio.getMod();
 
 /*----------------------------- rtl_433_ESP Internals -----------------------------*/
 
-#define rtl_433_ReceiverTask_Stack    2048
+#define rtl_433_ReceiverTask_Stack  2048
 #define rtl_433_ReceiverTask_Priority 2
 #define rtl_433_ReceiverTask_Core     0
 
@@ -118,6 +126,22 @@ int _rssiCount = 0;
 
 int _noiseCount = 0; // Count of ticks while receiver is disabled
 
+#if defined(RF_SX1231) || defined(RF_RF69)
+int _rssiPeak = -128;
+unsigned long _rssiPeakAt = 0;
+
+// RegRxBw holds a mantissa/exponent pair, and OOK halves the result relative to
+// FSK, so the raw byte reads as double the real bandwidth unless you account
+// for the modulation.
+static int _decodeRxBandwidth(uint8_t regRxBw) {
+  uint32_t mantissa = 4 * ((regRxBw >> 3) & 0x03) + 16;
+  uint8_t exponent = regRxBw & 0x07;
+  uint8_t shift = exponent + (rtl_433_ESP::ookModulation ? 3 : 2);
+  return (RADIOLIB_RF69_CRYSTAL_FREQ * 1000000.0) /
+         (mantissa * ((uint32_t)1 << shift) * 1000.0);
+}
+#endif
+
 #ifdef DEAF_WORKAROUND
 unsigned long _deafWorkaround = millis();
 #endif
@@ -141,7 +165,7 @@ rtl_433_ESP::rtl_433_ESP() {
  * @param receiveFrequency - receive frequency
  */
 void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
-#if defined(RF_SX1276) || defined(RF_SX1278)
+#if defined(RF_SX1276) || defined(RF_SX1278) || defined(RF_SX1231)
   radio.reset();
 #endif
 
@@ -170,8 +194,28 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
 
   /*----------------------------- Initialize Transceiver -----------------------------*/
 
-#ifdef RF_CC1101
+#if defined(RF_CC1101) || defined(RF_SX1231) || defined(RF_RF69)
   int state = radio.begin();
+#  ifdef RF_RF69
+  // RF69 sometimes needs a retry after reset settles
+  for (int i = 0; (state != RADIOLIB_ERR_NONE) && (i < 5); i++) {
+    logprintfLn(LOG_WARNING, STR_MODULE " begin() retry %d", i + 1);
+    delay(50);
+    state = radio.begin();
+  }
+  // RadioLib >= 7.7.0 brings PhysicalLayer::setSyncWord into RF69 scope, where
+  // it is an exact match for begin()'s non-const uint8_t[] and hides RF69's own
+  // overload; the base is a stub returning ERR_UNSUPPORTED, so begin() always
+  // stops there. Finish the steps it skipped -- the same calls resolve to the
+  // RF69 overloads from here. Sync word and CRC are left to the OOK setup below,
+  // which disables both.
+  if (state == RADIOLIB_ERR_UNSUPPORTED) {
+    state = radio.setDataShaping(RADIOLIB_SHAPING_NONE);
+    RADIOLIB_STATE(state, "setDataShaping");
+    state = radio.setEncoding(RADIOLIB_ENCODING_NRZ);
+    RADIOLIB_STATE(state, "setEncoding");
+  }
+#  endif
 #else
   int state = radio.beginFSK();
 #endif
@@ -234,6 +278,44 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
   }
   state = radio.disableSyncWordFiltering(false);
   RADIOLIB_STATE(state, "disableSyncWordFiltering");
+#endif
+
+#if defined(RF_SX1231) || defined(RF_RF69)
+  if (ookModulation) {
+    state = radio.setOokThresholdType(RADIOLIB_RF69_OOK_THRESH_PEAK);
+    RADIOLIB_STATE(state, "OOK Thresh PEAK");
+
+    state = radio.setOokPeakThresholdDecrement(RADIOLIB_RF69_OOK_PEAK_THRESH_DEC_1_1_CHIP);
+    RADIOLIB_STATE(state, "OOK PEAK Thresh Decrement");
+
+    state = radio.setOokFixedThreshold(OokFixedThreshold);
+    RADIOLIB_STATE(state, "OokFixedThreshold");
+
+    state = radio.setBitRate(3.2);
+    RADIOLIB_STATE(state, "setBitRate");
+
+    state = radio.setRxBandwidth(250.0);
+    RADIOLIB_STATE(state, "setRxBandwidth");
+  } else {
+    state = radio.setFrequencyDeviation(40);
+    RADIOLIB_STATE(state, "setFrequencyDeviation");
+
+    state = radio.setBitRate(17.24);
+    RADIOLIB_STATE(state, "setBitRate");
+
+    state = radio.setRxBandwidth(200.0);
+    RADIOLIB_STATE(state, "setRxBandwidth");
+  }
+
+  state = radio.disableSyncWordFiltering();
+  RADIOLIB_STATE(state, "disableSyncWordFiltering");
+
+  state = radio.disableContinuousModeBitSync();
+  RADIOLIB_STATE(state, "disableContinuousModeBitSync");
+
+  // Configure DIO2 for continuous data output
+  state = radio.setDIOMapping(2, RADIOLIB_RF69_DIO2_CONT_DATA >> 2);
+  RADIOLIB_STATE(state, "setDIOMapping DIO2");
 #endif
 
 #if defined(RF_SX1276) || defined(RF_SX1278)
@@ -305,12 +387,13 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
 
   // Receviers configured, start reception
 
-#if defined(RF_SX1276) || defined(RF_SX1278)
+#if defined(RF_SX1276) || defined(RF_SX1278) || defined(RF_SX1231) || defined(RF_RF69)
   state = radio.receiveDirect();
+  RADIOLIB_STATE(state, "receiveDirect");
 #else
   state = radio.receiveDirectAsync();
+  RADIOLIB_STATE(state, "receiveDirectAsync");
 #endif
-  RADIOLIB_STATE(state, "receiveDirect");
 
 #ifdef RESOURCE_DEBUG
   logprintfLn(LOG_INFO, "rtl_433_ReceiverTask_Stack %d", rtl_433_ReceiverTask_Stack);
@@ -537,9 +620,19 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
     if (_enabledReceiver) {
       // Calculate average RSSI signal level in environment
 
-      currentRssi = _getRSSI();
+      int rawRssi = _getRSSI();
+#if defined(RF_SX1231) || defined(RF_RF69)
+      unsigned long rssiNow = micros();
+      if (rawRssi >= _rssiPeak || rssiNow - _rssiPeakAt > RSSI_PEAK_HOLD) {
+        _rssiPeak = rawRssi;
+        _rssiPeakAt = rssiNow;
+      }
+      currentRssi = _rssiPeak;
+#else
+      currentRssi = rawRssi;
+#endif
       _rssiCount++;
-      _totalRssi += currentRssi;
+      _totalRssi += rawRssi; // noise floor tracks raw samples, not the peak
 
       if (_rssiCount > RSSI_SAMPLES) // Adjust RSSI Signal Threshold
       {
@@ -611,7 +704,7 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
           totalSignals++;
           if ((_nrpulses > PD_MIN_PULSES) &&
               ((signalEnd - signalStart) >
-               MINIMUM_SIGNAL_LENGTH)) // Minimum signal length of MINIMUM_SIGNAL_LENGTH MS
+               MINIMUM_SIGNAL_DURATION)) // Minimum signal length of MINIMUM_SIGNAL_DURATION MS
           {
             _pulseTrains[_actualPulseTrain].num_pulses = _nrpulses + 1;
             _pulseTrains[_actualPulseTrain].signalDuration =
@@ -698,7 +791,7 @@ void rtl_433_ESP::setRSSIThreshold(int newRssi) {
 
 /**
  * @brief set OOK Threshold
- * 
+ *
  */
 #if defined(RF_SX1276) || defined(RF_SX1278)
 void rtl_433_ESP::setOOKThreshold(int newOokThreshold) {
@@ -709,6 +802,19 @@ void rtl_433_ESP::setOOKThreshold(int newOokThreshold) {
 #  endif
 
   int state = radio.setOokFixedOrFloorThreshold(OokFixedThreshold);
+  RADIOLIB_STATE(state, "setOokFixedThreshold");
+}
+#endif
+
+#if defined(RF_SX1231) || defined(RF_RF69)
+void rtl_433_ESP::setOOKThreshold(int newOokThreshold) {
+  OokFixedThreshold = newOokThreshold;
+#  ifdef REGOOKFIX_DEBUG
+  logprintfLn(LOG_INFO, "Setting setOokFixedThreshold to: %d",
+              OokFixedThreshold);
+#  endif
+
+  int state = radio.setOokFixedThreshold(OokFixedThreshold);
   RADIOLIB_STATE(state, "setOokFixedThreshold");
 }
 #endif
@@ -794,7 +900,20 @@ void rtl_433_ESP::getStatus() {
  ****************************************************************/
 int rtl_433_ESP::_getRSSI(void) {
   int rssi;
-#ifdef RF_CC1101
+#if defined(RF_SX1231) || defined(RF_RF69)
+  // RegRssiValue only updates when a measurement is triggered, or once
+  // automatically on RX entry. RadioLib's getRSSI() is a bare register read
+  // (written for packet mode), so without this trigger the value is frozen at
+  // the RX-entry sample and the receiveMode gate can never open.
+  _mod->SPIwriteRegister(RADIOLIB_RF69_REG_RSSI_CONFIG,
+                         RADIOLIB_RF69_RSSI_START);
+  for (int i = 0; i < RSSI_TRIGGER_RETRIES; i++) {
+    if (_mod->SPIreadRegister(RADIOLIB_RF69_REG_RSSI_CONFIG) &
+        RADIOLIB_RF69_RSSI_DONE)
+      break;
+  }
+  rssi = -(_mod->SPIreadRegister(RADIOLIB_RF69_REG_RSSI_VALUE) / 2);
+#elif defined(RF_CC1101)
   rssi = radio.getRSSI();
 #elif RADIOLIB_VERSION_MAJOR >= 6
   rssi = radio.getRSSI(true, true);
@@ -966,6 +1085,46 @@ void rtl_433_ESP::getModuleStatus() {
   alogprintfLn(LOG_INFO, "----- SX127x Status -----");
 
 #endif
+
+#if defined(RF_SX1231) || defined(RF_RF69)
+  alogprintfLn(LOG_INFO, "----- %s Status -----", STR_MODULE);
+
+  OokFixedThreshold = _mod->SPIreadRegister(RADIOLIB_RF69_REG_OOK_FIX);
+
+  alogprintfLn(LOG_INFO, "RegOpMode: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_OP_MODE));
+  alogprintfLn(LOG_INFO, "RegDataModul: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_DATA_MODUL));
+  alogprintfLn(LOG_INFO, "RegBitrateMsb: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_BITRATE_MSB));
+  alogprintfLn(LOG_INFO, "RegBitrateLsb: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_BITRATE_LSB));
+  alogprintfLn(LOG_INFO, "RegRxBw: 0x%.2x (%d kHz)",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_RX_BW),
+               _decodeRxBandwidth(
+                   _mod->SPIreadRegister(RADIOLIB_RF69_REG_RX_BW)));
+  alogprintfLn(LOG_INFO, "RegAfcBw: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_AFC_BW));
+  if (ookModulation) {
+    alogprintfLn(LOG_INFO, "-------------------------");
+    alogprintfLn(LOG_INFO, "RegOokPeak: 0x%.2x",
+                 _mod->SPIreadRegister(RADIOLIB_RF69_REG_OOK_PEAK));
+    alogprintfLn(LOG_INFO, "RegOokFix: 0x%.2x", OokFixedThreshold);
+    alogprintfLn(LOG_INFO, "RegOokAvg: 0x%.2x",
+                 _mod->SPIreadRegister(RADIOLIB_RF69_REG_OOK_AVG));
+  }
+  alogprintfLn(LOG_INFO, "-------------------------");
+  alogprintfLn(LOG_INFO, "RegLna: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_LNA));
+  alogprintfLn(LOG_INFO, "RegDioMapping1: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_DIO_MAPPING_1));
+  alogprintfLn(LOG_INFO, "RegDioMapping2: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_DIO_MAPPING_2));
+  alogprintfLn(LOG_INFO, "RegVersion: 0x%.2x",
+               _mod->SPIreadRegister(RADIOLIB_RF69_REG_VERSION));
+
+  alogprintfLn(LOG_INFO, "----- %s Status -----", STR_MODULE);
+#endif
 }
 
 /**
@@ -978,7 +1137,7 @@ int16_t rtl_433_ESP::setFrequencyDeviation(float value) {
 }
 
 int16_t rtl_433_ESP::receiveDirect() {
-#if defined(RF_SX1276) || defined(RF_SX1278)
+#if defined(RF_SX1276) || defined(RF_SX1278) || defined(RF_SX1231) || defined(RF_RF69)
   return radio.receiveDirect();
 #else
   return radio.receiveDirectAsync();
